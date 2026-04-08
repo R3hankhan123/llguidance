@@ -112,18 +112,53 @@ impl LLInterpreter {
     fn unsafe_compute_mask_ptr(&mut self, trg_ptr: usize, trg_bytes: usize) -> PyResult<String> {
         self.validate_mask_ptr(trg_ptr, trg_bytes)?;
         let r = self.inner.compute_mask().map_err(val_error)?;
-        let trg_slice =
-            unsafe { std::slice::from_raw_parts_mut(trg_ptr as *mut u32, trg_bytes / 4) };
+        
         if let Some(m) = r.sample_mask.as_ref() {
             let src = m.as_slice();
-            trg_slice.copy_from_slice(&src[0..trg_slice.len()]);
+            #[cfg(target_endian = "little")]
+            {
+                let trg_slice = unsafe { std::slice::from_raw_parts_mut(trg_ptr as *mut u32, trg_bytes / 4) };
+                trg_slice.copy_from_slice(&src[0..trg_slice.len()]);
+            }
+            #[cfg(target_endian = "big")]
+            {
+                // Must write little-endian bytes so token N is at byte N/8, bit N%8
+                let trg_slice = unsafe { std::slice::from_raw_parts_mut(trg_ptr as *mut u8, trg_bytes) };
+                for (i, &word) in src.iter().enumerate() {
+                    let start = i * 4;
+                    if start + 4 <= trg_bytes {
+                        trg_slice[start..start + 4].copy_from_slice(&word.to_le_bytes());
+                    }
+                }
+            }
         } else {
-            trg_slice.fill(0);
-            let trie = self.inner.tok_trie();
-            let eos = trie.eos_token();
-            let eos_ok = (eos as usize) < trie.vocab_size();
-            if eos_ok {
-                trg_slice[eos as usize / 32] |= 1 << (eos % 32);
+            #[cfg(target_endian = "little")]
+            {
+                let trg_slice = unsafe { std::slice::from_raw_parts_mut(trg_ptr as *mut u32, trg_bytes / 4) };
+                trg_slice.fill(0);
+                let trie = self.inner.tok_trie();
+                let eos = trie.eos_token();
+                let eos_ok = (eos as usize) < trie.vocab_size();
+                if eos_ok {
+                    trg_slice[eos as usize / 32] |= 1 << (eos % 32);
+                }
+            }
+            #[cfg(target_endian = "big")]
+            {
+                // Write all zeros in little-endian byte order, then set EOS bit
+                let trg_slice = unsafe { std::slice::from_raw_parts_mut(trg_ptr as *mut u8, trg_bytes) };
+                trg_slice.fill(0);
+                let trie = self.inner.tok_trie();
+                let eos = trie.eos_token();
+                let eos_ok = (eos as usize) < trie.vocab_size();
+                if eos_ok {
+                    // Set bit (eos%8) in byte (eos/8) for little-endian byte layout
+                    let byte_idx = (eos as usize) / 8;
+                    let bit_idx = (eos as usize) % 8;
+                    if byte_idx < trg_bytes {
+                        trg_slice[byte_idx] |= 1 << bit_idx;
+                    }
+                }
             }
         }
 
@@ -135,11 +170,20 @@ impl LLInterpreter {
         let r = self.inner.compute_mask().map_err(val_error)?;
         let trg_slice = unsafe { trg.as_bytes_mut() };
         if let Some(m) = r.sample_mask.as_ref() {
-            let src = bytemuck::cast_slice::<u32, u8>(m.as_slice());
-            if trg_slice.len() > src.len() {
-                trg_slice[..src.len()].copy_from_slice(src);
-            } else {
-                trg_slice.copy_from_slice(&src[..trg_slice.len()]);
+            let src = m.as_slice();
+            let copy_len = std::cmp::min(trg_slice.len() / 4, src.len());
+            
+            #[cfg(target_endian = "little")]
+            {
+                let src_bytes = bytemuck::cast_slice::<u32, u8>(&src[..copy_len]);
+                trg_slice[..src_bytes.len()].copy_from_slice(src_bytes);
+            }
+            #[cfg(target_endian = "big")]
+            {
+                for (i, &word) in src[..copy_len].iter().enumerate() {
+                    let le_bytes = word.to_le_bytes();
+                    trg_slice[i * 4..(i + 1) * 4].copy_from_slice(&le_bytes);
+                }
             }
         } else {
             trg_slice.fill(0);

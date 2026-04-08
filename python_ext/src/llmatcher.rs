@@ -230,10 +230,42 @@ impl LLMatcher {
 
     fn unsafe_compute_mask_ptr_inner(&mut self, trg_ptr: usize, trg_bytes: usize) {
         let r = self.compute_mask_or_eos();
-        let trg_slice =
-            unsafe { std::slice::from_raw_parts_mut(trg_ptr as *mut u32, trg_bytes / 4) };
         let src = r.as_slice();
-        trg_slice.copy_from_slice(&src[0..trg_slice.len()]);
+        
+        // Debug logging for big-endian systems
+        #[cfg(target_endian = "big")]
+        {
+            if src.len() > 0 {
+                eprintln!("DEBUG [llguidance]: Mask computation:");
+                eprintln!("  First 4 u32 words: 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}", 
+                    src.get(0).unwrap_or(&0),
+                    src.get(1).unwrap_or(&0),
+                    src.get(2).unwrap_or(&0),
+                    src.get(3).unwrap_or(&0));
+                
+                // Check which tokens are allowed in first 128
+                let mut allowed = Vec::new();
+                for tok in 0..128.min(self.tok_env.tok_trie().vocab_size()) {
+                    let word_idx = tok / 32;
+                    let bit_idx = tok % 32;
+                    if word_idx < src.len() && (src[word_idx] & (1 << bit_idx)) != 0 {
+                        allowed.push(tok);
+                    }
+                }
+                eprintln!("  Allowed tokens in [0..128): {:?}", allowed);
+                eprintln!("  Total mask words: {}, vocab_size: {}", src.len(), self.tok_env.tok_trie().vocab_size());
+            }
+        }
+        
+        // Write u32 values in native byte order
+        let trg_slice = unsafe { std::slice::from_raw_parts_mut(trg_ptr as *mut u32, trg_bytes / 4) };
+        let copy_len = std::cmp::min(src.len(), trg_slice.len());
+        trg_slice[..copy_len].copy_from_slice(&src[..copy_len]);
+        
+        // Zero out any remaining space
+        if copy_len < trg_slice.len() {
+            trg_slice[copy_len..].fill(0);
+        }
     }
 
     fn unsafe_compute_mask_ptr_inner_with_draft_tokens(
@@ -515,7 +547,18 @@ impl LLMatcher {
     fn compute_bitmask(&mut self, py: Python<'_>) -> Cow<'_, [u8]> {
         py.detach(|| {
             let m = self.compute_mask_or_eos();
-            Cow::Owned(bytemuck::cast_slice(m.as_slice()).to_vec())
+            #[cfg(target_endian = "little")]
+            {
+                Cow::Owned(bytemuck::cast_slice(m.as_slice()).to_vec())
+            }
+            #[cfg(target_endian = "big")]
+            {
+                let mut result = Vec::with_capacity(m.as_slice().len() * 4);
+                for &word in m.as_slice() {
+                    result.extend_from_slice(&word.to_le_bytes());
+                }
+                Cow::Owned(result)
+            }
         })
     }
 
